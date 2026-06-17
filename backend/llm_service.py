@@ -101,7 +101,15 @@ def resolve_port_name(text: str) -> Optional[str]:
 
 
 def extract_ports_from_text(text: str):
-    """从自然语言文本中提取起运港和目的港，支持中文港口名和PORT代码"""
+    """
+    从自然语言文本中提取起运港和目的港，支持中文港口名和PORT代码。
+
+    识别规则：
+    1. "从X到Y" 格式：X是起运港，Y是目的港
+    2. "到X/运到X" 格式：X是目的港
+    3. "从X出发" 格式：X是起运港
+    4. 只有一个港口时：根据方向词判断，无方向词默认起运港
+    """
     orig_port = None
     dest_port = None
 
@@ -114,7 +122,29 @@ def extract_ports_from_text(text: str):
         orig_port = resolve_port_name(route_pattern.group(1))
         dest_port = resolve_port_name(route_pattern.group(2))
 
-    # 模式2: 匹配 "PORTxx" 代码（兜底，支持一位或两位数字）
+    # 模式2: "到X/运到X/发到X/送到X" → 目的港（优先检测）
+    if not dest_port:
+        dest_pattern = re.search(
+            r'(?:运|发|送|寄)?到\s*([^\s，,。从出发运寄]{2,})',
+            text
+        )
+        if dest_pattern:
+            resolved = resolve_port_name(dest_pattern.group(1))
+            if resolved:
+                dest_port = resolved
+
+    # 模式3: "从X出发/从X起运" → 起运港
+    if not orig_port:
+        orig_pattern = re.search(
+            r'从\s*([^\s，,。到发运寄]{2,})\s*(?:出发|发货|发出|起运|寄出|走)?',
+            text
+        )
+        if orig_pattern:
+            resolved = resolve_port_name(orig_pattern.group(1))
+            if resolved:
+                orig_port = resolved
+
+    # 模式4: 匹配 "PORTxx" 代码（兜底，支持一位或两位数字）
     if not orig_port and not dest_port:
         port_codes = re.findall(r'PORT\s*(\d{1,2})', text, re.IGNORECASE)
         # 补零规范化
@@ -131,15 +161,17 @@ def extract_ports_from_text(text: str):
                 else:
                     orig_port = code
 
-    # 模式3: 逐词匹配中文港口名（兜底）
-    if not orig_port:
+    # 模式5: 逐词匹配中文港口名（兜底）- 考虑方向词
+    if not orig_port and not dest_port:
         for name, code in PORT_NAME_MAP.items():
             if len(name) >= 2 and name in text:
-                if orig_port is None:
-                    orig_port = code
-                elif dest_port is None and code != orig_port:
+                # 检查该港口名是否在"到X"模式中
+                dest_check = re.search(rf'(?:运|发|送|寄)?到\s*{re.escape(name)}', text)
+                if dest_check:
                     dest_port = code
-                    break
+                else:
+                    orig_port = code
+                break  # 只处理第一个匹配的港口
 
     return orig_port, dest_port
 
@@ -1154,41 +1186,98 @@ class LLMService:
         }
 
     def _extract_followup_slots(self, text: str, partial_order: dict) -> Dict[str, Any]:
-        """从多轮补充话术中提取缺失字段，不自动补全不存在的信息。"""
-        result = self._raw_extract(text)
+        """
+        从多轮补充话术中提取缺失字段。
 
-        if partial_order.get("orig_port") is None and result.get("orig_port") is None:
-            orig_patterns = [
-                r'从\s*([^\s，,。到发运寄出]+)\s*(?:出发|发货|发出|起运|寄出)',
-                r'([^\s，,。到发运寄出]+)\s*(?:出发|发货|发出|起运|寄出)',
-                r'起运港?\s*(?:是|为|：|:)?\s*([^\s，,。]+)',
-            ]
-            for pattern in orig_patterns:
-                match = re.search(pattern, text)
-                if match:
-                    result["orig_port"] = resolve_port_name(match.group(1))
-                    if result["orig_port"]:
+        设计原则：
+        1. 只提取用户明确提供的信息，不自动补全
+        2. 根据方向词（从/到）判断填入 orig_port 还是 dest_port
+        3. 如果只有一个港口名且没有方向词，根据缺失字段智能分配
+        """
+        result = {"weight": None, "orig_port": None, "dest_port": None, "max_days": None, "priority": None}
+
+        # 提取重量
+        result["weight"] = self._extract_weight(text)
+
+        # 提取天数
+        result["max_days"] = self._raw_extract_days(text)
+
+        # 提取优先级
+        result["priority"] = self._raw_extract_priority(text)
+
+        # ============================================================
+        # 港口提取：根据方向词判断
+        # ============================================================
+
+        # 模式1: "从X出发/起运/发货" → orig_port
+        orig_match = re.search(
+            r'从\s*([^\s，,。到发运寄出]+)\s*(?:出发|发货|发出|起运|寄出|走)',
+            text
+        )
+        if orig_match:
+            resolved = resolve_port_name(orig_match.group(1))
+            if resolved:
+                result["orig_port"] = resolved
+
+        # 模式2: "到X/运到X/发到X/送到X" → dest_port
+        if not result["dest_port"]:
+            dest_match = re.search(
+                r'(?:到|运到|发到|送到|寄到|运往|发往|送往)\s*([^\s，,。从出发运寄]+)',
+                text
+            )
+            if dest_match:
+                resolved = resolve_port_name(dest_match.group(1))
+                if resolved:
+                    result["dest_port"] = resolved
+
+        # 模式3: "起运港X/出发港X" → orig_port
+        if not result["orig_port"]:
+            orig_port_match = re.search(
+                r'(?:起运港?|出发港?|发货港?)\s*(?:是|为|：|:)?\s*([^\s，,。到]+)',
+                text
+            )
+            if orig_port_match:
+                resolved = resolve_port_name(orig_port_match.group(1))
+                if resolved:
+                    result["orig_port"] = resolved
+
+        # 模式4: "目的港X/到达港X" → dest_port
+        if not result["dest_port"]:
+            dest_port_match = re.search(
+                r'(?:目的港?|到达港?|终点港?)\s*(?:是|为|：|:)?\s*([^\s，,。从]+)',
+                text
+            )
+            if dest_port_match:
+                resolved = resolve_port_name(dest_port_match.group(1))
+                if resolved:
+                    result["dest_port"] = resolved
+
+        # 模式5: 兜底 - 逐词匹配中文港口名（考虑方向词）
+        if not result["orig_port"] or not result["dest_port"]:
+            for name, code in PORT_NAME_MAP.items():
+                if len(name) >= 2 and name in text:
+                    # 检查是否在 "到X" 模式中
+                    is_dest = bool(re.search(rf'(?:运|发|送|寄)?到\s*{re.escape(name)}', text))
+                    if is_dest and result["dest_port"] is None:
+                        result["dest_port"] = code
+                    elif not is_dest and result["orig_port"] is None:
+                        result["orig_port"] = code
+                    # 如果两个都找到了就退出
+                    if result["orig_port"] and result["dest_port"]:
                         break
 
-        if partial_order.get("dest_port") is None and result.get("dest_port") is None:
-            dest_patterns = [
-                r'(?:到|运到|发到|送到|寄到)\s*([^\s，,。]+)',
-                r'目的港?\s*(?:是|为|：|:)?\s*([^\s，,。]+)',
-            ]
-            for pattern in dest_patterns:
-                match = re.search(pattern, text)
-                if match:
-                    result["dest_port"] = resolve_port_name(match.group(1))
-                    if result["dest_port"]:
-                        break
-
-        # 兜底：如果用户只输入了一个 PORT 代码（如 "PORT08"、"port3"），
-        # 没有方向词，根据缺失字段智能分配
+        # 模式6: 兜底 - 只输入了一个港口名（无方向词），根据缺失字段智能分配
         bare_port = resolve_port_name(text.strip())
         if bare_port:
-            if partial_order.get("orig_port") is None and result.get("orig_port") is None:
+            if result["orig_port"] is None and result["dest_port"] is None:
+                # 两个都没识别到，根据 partial_order 的缺失情况分配
+                if partial_order.get("orig_port") is None:
+                    result["orig_port"] = bare_port
+                elif partial_order.get("dest_port") is None:
+                    result["dest_port"] = bare_port
+            elif result["orig_port"] is None:
                 result["orig_port"] = bare_port
-            elif partial_order.get("dest_port") is None and result.get("dest_port") is None:
+            elif result["dest_port"] is None:
                 result["dest_port"] = bare_port
 
         return result

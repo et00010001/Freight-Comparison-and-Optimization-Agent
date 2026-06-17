@@ -219,19 +219,54 @@ async def agentic_chat(request: ChatRequest):
             partial_order = session.partial_data if session.partial_data else None
 
         # ================================================================
-        # 阶段 1: LLM 主导意图解析（含 fallback 链）
+        # 阶段 1: 意图解析
+        # 优化：多轮补充字段时，直接用代码解析，不调用 LLM
         # ================================================================
-        classification = llm_service.parse_agent_intent(
-            message=request.message,
-            session_id=request.session_id,
-            partial_order=partial_order,
+        is_followup = (
+            partial_order is not None
+            and session is not None
+            and session.missing_fields
+            and session.current_state == "parsing"
         )
 
-        intent = classification["intent"]
-        order = classification["order"]
-        missing = classification.get("missing_fields", [])
-        parse_source = classification.get("parse_source", "fallback")
-        llm_message = classification.get("message", "")
+        if is_followup:
+            # 多轮补充字段：用代码直接解析，避免 LLM 错误解析
+            import re
+
+            # 提取用户补充的字段
+            followup_order = llm_service._extract_followup_slots(request.message, partial_order)
+
+            # 合并到 partial_order：只更新用户新提供的字段
+            order = dict(partial_order)
+            for field in ("weight", "orig_port", "dest_port", "max_days", "priority"):
+                if followup_order.get(field) is not None:
+                    order[field] = followup_order[field]
+
+            # 计算缺失字段
+            missing = []
+            if order.get("weight") is None:
+                missing.append("weight")
+            if order.get("orig_port") is None:
+                missing.append("orig_port")
+            if order.get("dest_port") is None:
+                missing.append("dest_port")
+
+            intent = "compare_freight"
+            parse_source = "code_followup"
+            llm_message = ""
+        else:
+            # 首次输入或无会话上下文：调用 LLM 解析
+            classification = llm_service.parse_agent_intent(
+                message=request.message,
+                session_id=request.session_id,
+                partial_order=partial_order,
+            )
+
+            intent = classification["intent"]
+            order = classification["order"]
+            missing = classification.get("missing_fields", [])
+            parse_source = classification.get("parse_source", "fallback")
+            llm_message = classification.get("message", "")
 
         # 构建 order 对象
         order_info = AgenticOrderInfo(
