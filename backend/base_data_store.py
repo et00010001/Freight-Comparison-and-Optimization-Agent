@@ -9,6 +9,8 @@ from typing import List, Dict, Any
 class BaseDataStore(ABC):
     """数据源抽象基类"""
 
+    has_service_rating: bool = False
+
     @abstractmethod
     def get_available_ports(self) -> dict:
         """获取可用港口列表，返回 {"orig_ports": [...], "dest_ports": [...]}"""

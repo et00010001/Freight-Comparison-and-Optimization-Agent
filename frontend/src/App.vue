@@ -16,7 +16,7 @@
     />
 
     <section class="overview-strip">
-      <StatisticsCard :statistics="statistics" />
+      <StatisticsCard :statistics="statistics" @data-uploaded="handleDataUploaded" />
     </section>
 
     <main class="workbench">
@@ -271,6 +271,15 @@ const loadData = async () => {
   } catch (e) {
     console.error('加载数据失败:', e)
   }
+}
+
+const handleDataUploaded = (data) => {
+  // 上传成功后刷新统计数据和港口列表
+  loadData()
+  // 清空之前的比价结果
+  result.value = null
+  report.value = ''
+  flowStep.value = 0
 }
 
 const agentStatus = computed(() => {

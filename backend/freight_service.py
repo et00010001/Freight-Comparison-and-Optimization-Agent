@@ -33,6 +33,13 @@ class CSVDataStore(BaseDataStore):
 
         self.df = clean_dataframe(self.df)
 
+        # 检测是否包含真实的服务评分（不全为默认值 'C'）
+        if 'Service_Rating' in self.df.columns:
+            unique_vals = set(self.df['Service_Rating'].dropna().unique()) - {'C'}
+            self.has_service_rating = len(unique_vals) > 0
+        else:
+            self.has_service_rating = False
+
     def get_available_ports(self) -> dict:
         orig_ports = sorted(self.df['Orig_Port'].unique().tolist())
         dest_ports = sorted(self.df['Dest_Port'].unique().tolist())
@@ -55,6 +62,7 @@ class CSVDataStore(BaseDataStore):
             "dest_ports": sorted(self.df['Dest_Port'].unique().tolist()),
             "transport_modes": sorted(self.df['Mode_DSC'].unique().tolist()),
             "service_levels": sorted(self.df['Service_Level'].unique().tolist()),
+            "has_service_rating": self.has_service_rating,
         }
 
     def match_plans(self, order: OrderRequest) -> List[Dict[str, Any]]:
@@ -153,9 +161,11 @@ class DBDataStore(BaseDataStore):
         self._session_factory = db_session_factory
 
         self._df = None  # 惰性加载的 DataFrame，供 GraphRouter 使用
+        self.has_service_rating = False
 
         if auto_init:
             self._ensure_data()
+            self._detect_service_rating()
 
         # TTL 缓存
         self._cache: Dict[str, tuple] = {}  # key -> (value, expire_time)
@@ -174,6 +184,26 @@ class DBDataStore(BaseDataStore):
                 init_db_if_needed(force=False)
         finally:
             session.close()
+
+    def _detect_service_rating(self):
+        """检测数据库中是否包含真实的服务评分（不全为默认值 'C'）"""
+        from sqlalchemy import distinct
+        from db_models import FreightRate
+        session = self._session()
+        try:
+            ratings = [r[0] for r in session.query(distinct(FreightRate.service_rating)).all()]
+            unique_vals = set(ratings) - {'C', None}
+            self.has_service_rating = len(unique_vals) > 0
+        except Exception:
+            self.has_service_rating = False
+        finally:
+            session.close()
+
+    def refresh_service_rating(self):
+        """刷新服务评分检测（上传新数据后调用）"""
+        self._df = None  # 清除 DataFrame 缓存
+        self._cache.clear()  # 清除 TTL 缓存
+        self._detect_service_rating()
 
     @property
     def df(self):
@@ -305,6 +335,7 @@ class DBDataStore(BaseDataStore):
                 "dest_ports": dest_ports,
                 "transport_modes": modes,
                 "service_levels": levels,
+                "has_service_rating": self.has_service_rating,
             }
             self._set_cached("statistics", result)
             return result
@@ -540,6 +571,15 @@ class FreightService:
                 weights = ScoringWeights(cost_weight=0.5, time_weight=0.3, service_weight=0.2)
             else:
                 weights = ScoringWeights(cost_weight=0.4, time_weight=0.3, service_weight=0.3)
+
+        # 无服务评分时，将 service 权重平分给 cost 和 time
+        if not self.data_store.has_service_rating and weights.service_weight > 0:
+            half = weights.service_weight / 2
+            weights = ScoringWeights(
+                cost_weight=weights.cost_weight + half,
+                time_weight=weights.time_weight + half,
+                service_weight=0.0,
+            )
 
         for plan in filtered_plans:
             score, details = self.calculate_score(plan, filtered_plans, weights)

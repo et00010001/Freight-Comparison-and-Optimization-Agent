@@ -1,11 +1,13 @@
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException, Request, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
 from typing import Optional, List
 import os
+import io
 import logging
+import pandas as pd
 
 logger = logging.getLogger(__name__)
 
@@ -194,6 +196,168 @@ async def get_statistics():
 async def get_cache_stats():
     """获取缓存统计信息"""
     return freight_service.get_cache_stats()
+
+
+REQUIRED_COLUMNS = [
+    'Carrier', 'Orig_Port', 'Dest_Port', 'Min_Weight_Quant', 'Max_Weight_Quant',
+    'Service_Level', 'Min_Cost', 'Rate', 'Mode_DSC', 'TPT_Day_Count', 'Carrier_Type'
+]
+
+
+@app.post("/api/upload_data")
+async def upload_data(file: UploadFile = File(...)):
+    """上传 CSV/Excel 文件替换数据库中的运价数据"""
+    global data_store, freight_service
+
+    # 校验文件类型
+    filename = file.filename.lower()
+    if not (filename.endswith('.csv') or filename.endswith('.xlsx') or filename.endswith('.xls')):
+        raise HTTPException(status_code=400, detail="仅支持 CSV 和 Excel (.xlsx/.xls) 文件")
+
+    try:
+        content = await file.read()
+
+        # 读取为 DataFrame
+        if filename.endswith('.csv'):
+            df = pd.read_csv(io.BytesIO(content))
+        else:
+            df = pd.read_excel(io.BytesIO(content))
+
+        # 清洗
+        from common.data_cleaner import clean_dataframe
+        df = clean_dataframe(df)
+
+        # 校验必需列
+        missing_cols = [c for c in REQUIRED_COLUMNS if c not in df.columns]
+        if missing_cols:
+            raise HTTPException(
+                status_code=400,
+                detail=f"缺少必需列: {', '.join(missing_cols)}"
+            )
+
+        if len(df) == 0:
+            raise HTTPException(status_code=400, detail="文件中没有有效数据")
+
+        # 检测是否有服务评分
+        has_rating = False
+        if 'Service_Rating' in df.columns:
+            unique_vals = set(df['Service_Rating'].dropna().unique()) - {'C'}
+            has_rating = len(unique_vals) > 0
+
+        # 导入数据库
+        from database import get_session_factory
+        from db_models import FreightRate
+
+        Session = get_session_factory()
+        session = Session()
+        try:
+            session.query(FreightRate).delete()
+            session.commit()
+
+            records = []
+            for _, row in df.iterrows():
+                records.append({
+                    "carrier": row['Carrier'],
+                    "orig_port": row['Orig_Port'],
+                    "dest_port": row['Dest_Port'],
+                    "min_weight": float(row['Min_Weight_Quant']),
+                    "max_weight": float(row['Max_Weight_Quant']),
+                    "service_level": row['Service_Level'],
+                    "min_cost": float(row['Min_Cost']),
+                    "rate": float(row['Rate']),
+                    "mode": row['Mode_DSC'],
+                    "transport_days": int(row['TPT_Day_Count']),
+                    "carrier_type": row['Carrier_Type'],
+                    "service_rating": row.get('Service_Rating', 'C'),
+                })
+
+            batch_size = config.IMPORT_BATCH_SIZE
+            for i in range(0, len(records), batch_size):
+                batch = records[i:i + batch_size]
+                session.bulk_insert_mappings(FreightRate, batch)
+                session.commit()
+
+        except Exception as e:
+            session.rollback()
+            raise HTTPException(status_code=500, detail=f"数据导入失败: {str(e)}")
+        finally:
+            session.close()
+
+        # 刷新 freight_service 的缓存和评分检测
+        if hasattr(freight_service.data_store, 'refresh_service_rating'):
+            freight_service.data_store.refresh_service_rating()
+        freight_service.clear_compare_cache()
+
+        # 重新创建数据源实例以刷新内存状态
+        from database import get_session_factory
+        from freight_service import DBDataStore, FreightService
+        session_factory = get_session_factory()
+        data_store = DBDataStore(session_factory, auto_init=False)
+        data_store._detect_service_rating()
+        freight_service = FreightService(data_store)
+
+        carriers = sorted(df['Carrier'].unique().tolist())
+
+        return {
+            "success": True,
+            "message": f"成功导入 {len(df)} 条记录",
+            "total_records": len(df),
+            "carriers": carriers,
+            "has_service_rating": has_rating,
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"文件处理失败: {str(e)}")
+
+
+@app.get("/api/data_preview")
+async def data_preview(page: int = 1, page_size: int = 50):
+    """分页浏览数据库中的运价数据（只读）"""
+    from database import get_engine
+    from sqlalchemy import text
+
+    engine = get_engine()
+    try:
+        with engine.connect() as conn:
+            # 总行数
+            total = conn.execute(text("SELECT COUNT(*) FROM freight_rates")).scalar()
+
+            # 列名
+            columns = [
+                'id', 'carrier', 'orig_port', 'dest_port',
+                'min_weight', 'max_weight', 'service_level',
+                'min_cost', 'rate', 'mode', 'transport_days',
+                'carrier_type', 'service_rating'
+            ]
+
+            # 分页查询
+            offset = (page - 1) * page_size
+            rows = conn.execute(
+                text(f"SELECT * FROM freight_rates LIMIT :limit OFFSET :offset"),
+                {"limit": page_size, "offset": offset}
+            ).fetchall()
+
+            row_list = []
+            for row in rows:
+                row_dict = {}
+                for i, col in enumerate(columns):
+                    val = row[i]
+                    if hasattr(val, '__float__'):
+                        val = float(val)
+                    row_dict[col] = val
+                row_list.append(row_dict)
+
+        return {
+            "total": total,
+            "page": page,
+            "page_size": page_size,
+            "columns": columns,
+            "rows": row_list,
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"数据查询失败: {str(e)}")
 
 
 @app.post("/api/compare", response_model=ComparisonResult)
