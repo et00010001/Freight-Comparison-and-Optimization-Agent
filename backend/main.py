@@ -737,33 +737,21 @@ async def agentic_chat(request: ChatRequest, req: Request):
                 fallback_data = result.fallback_transfer.model_dump() if result.fallback_transfer else None
 
                 # ---- LLM 反馈生成（阶段2） ----
-                # 快速路径解析时，直接用模板反馈（避免调 LLM 拖慢速度）
-                if parse_source == "regex_fast":
-                    fb = {
-                        "message": active_llm._build_template_feedback(
-                            "recommendation" if rec else "general",
-                            order, rec.model_dump() if rec else None,
-                            plans_data, result.total_plans_found,
-                            result.scoring_weights, None, []
-                        ),
-                        "feedback_source": "template",
-                        "feedback_reason": "regex_fast_path",
-                    }
-                else:
-                    fb = active_llm.generate_agent_feedback(
-                        user_message=request.message,
-                        order=order,
-                        recommendation=rec.model_dump() if rec else None,
-                        plans=plans_data,
-                        total_plans_found=result.total_plans_found,
-                        scoring_weights=result.scoring_weights,
-                        reply_type="recommendation" if rec else "general",
-                        intent=intent,
-                        parse_source=parse_source,
-                        next_actions=[],
-                        transfer_routes=transfer_data,
-                        fallback_transfer=fallback_data,
-                    )
+                # 始终调用 LLM 生成推荐理由，仅在 LLM 不可用时降级为模板
+                fb = active_llm.generate_agent_feedback(
+                    user_message=request.message,
+                    order=order,
+                    recommendation=rec.model_dump() if rec else None,
+                    plans=plans_data,
+                    total_plans_found=result.total_plans_found,
+                    scoring_weights=result.scoring_weights,
+                    reply_type="recommendation" if rec else "general",
+                    intent=intent,
+                    parse_source=parse_source,
+                    next_actions=[],
+                    transfer_routes=transfer_data,
+                    fallback_transfer=fallback_data,
+                )
                 message = fb["message"]
                 feedback_source = fb["feedback_source"]
                 feedback_reason = fb["feedback_reason"]
@@ -821,24 +809,15 @@ async def agentic_chat(request: ChatRequest, req: Request):
                     ]
 
                 # ---- LLM 反馈生成（阶段2） ----
-                # 快速路径解析时，反馈也用模板（避免调 LLM 拖慢速度）
-                if parse_source == "regex_fast":
-                    fb = {
-                        "message": active_llm._build_template_feedback(
-                            "no_result", order, None, [], 0, None, no_result_reason, next_actions
-                        ),
-                        "feedback_source": "template",
-                        "feedback_reason": "regex_fast_path",
-                    }
-                else:
-                    fb = active_llm.generate_agent_feedback(
-                        user_message=request.message,
-                        order=order,
-                        recommendation=None,
-                        plans=[],
-                        total_plans_found=0,
-                        scoring_weights=None,
-                        reply_type="no_result",
+                # 始终调用 LLM 生成反馈，仅在 LLM 不可用时降级为模板
+                fb = active_llm.generate_agent_feedback(
+                    user_message=request.message,
+                    order=order,
+                    recommendation=None,
+                    plans=[],
+                    total_plans_found=0,
+                    scoring_weights=None,
+                    reply_type="no_result",
                     intent=intent,
                     parse_source=parse_source,
                     no_result_reason=no_result_reason,
